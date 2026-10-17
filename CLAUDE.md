@@ -62,10 +62,13 @@ The server uses a strategy pattern with an abstract base:
 - `backends/ezdxf_backend.py` — `EzdxfBackend`: file-based DXF operations using the `ezdxf` library. All sync ezdxf calls are wrapped with `asyncio.to_thread` via `_async()`. Transactions are implemented as full DXF snapshots on an `_undo_stack`.
 - `backends/com_backend.py` — `ComBackend`: live AutoCAD control via `pywin32` COM. All COM calls are routed through a `ThreadPoolExecutor` with a single thread to satisfy AutoCAD's STA (Single-Threaded Apartment) COM requirement.
 
+- `backends/mac_live_backend.py` / `backends/mac_bridge.py` — `MacLiveBackend(EzdxfBackend)`: AutoCAD for Mac has no COM, so the ezdxf model is mirrored into the running AutoCAD by evaluating AutoLISP through the app's own `AutoLispDebugAdapter` (DAP) — no keyboard, no focus. Rules that are not optional: never `load` a file (the "File Loading - Security Concern" modal blocks AutoCAD, and its Support folder is not trusted); never open a document from the background (it raises AutoCAD — only `system_launch` may); never start the adapter as a child of the server and always `disconnect` (an unclean session locks AutoCAD until restart); only the `mcp-live`/claimed document is ever erased.
+
 Backend selection at startup (in `server.py::_make_backend`):
 1. Check `AUTOCAD_MCP_BACKEND` env var
 2. On Windows with `auto`/`com`: try COM first, fall back to ezdxf
-3. On non-Windows: always use ezdxf
+3. On macOS with `mac`, or `auto` while AutoCAD is running: `MacLiveBackend`
+4. Otherwise ezdxf
 
 ### FastMCP Server Structure (`server.py`)
 

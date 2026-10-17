@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **AutoCAD for Mac** (`AUTOCAD_MCP_BACKEND=mac`, and `auto` on macOS when AutoCAD is
+  running). `backends/mac_live_backend.py` keeps the ezdxf engine as the model and
+  mirrors it into the running AutoCAD through `backends/mac_bridge.py`, which evaluates
+  AutoLISP inside AutoCAD via the `AutoLispDebugAdapter` that ships in the app: no
+  keyboard input, no window focus, no file `load` (and so no "File Loading - Security
+  Concern" modal). Real `view_screenshot` (`PNGOUT`), real DWG (`-WBLOCK *`),
+  `system_run_lisp` / `system_run_command` inside AutoCAD, `system_launch` as attach
+  (pulls the live drawing into the model), and a conflict guard that never overwrites
+  edits made by hand. See the README section *AutoCAD for Mac*.
+- `server.autocad_lifespan` calls an optional `aclose()` on the backend at shutdown.
+
+### Notes
+
+- Measured on AutoCAD 2027 for Mac (26.0): `(command "_.OPEN")` evaluated through the adapter
+  opens nothing; `open -g` still raises AutoCAD; the adapter SIGKILLs its parent on
+  `disconnect` and a session that is not disconnected locks AutoCAD until restarted.
+  The bridge is built around those three facts.
+
 ## [1.6.0] — 2026-09-25
 
 The v1.6 roadmap, shipped as five tracks: 154 → 247 registered tools in 28

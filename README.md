@@ -19,7 +19,7 @@ Live through COM on Windows, or headless through ezdxf anywhere — one typed co
 
 </div>
 
-> **v1.6 release snapshot:** 247 tools · 8 resources · 5 prompt templates · 4992 collected tests.
+> **v1.6 release snapshot:** 247 tools · 8 resources · 5 prompt templates · 5015 collected tests.
 > 247 is the **registered** count; a default install advertises 242 over `tools/list`,
 > because `ENABLE_3D` is unset. `system_about` is the runtime authority.
 
@@ -195,6 +195,43 @@ One contract across 23 modules in `backends/contracts/`. `@capability(key, reaso
 > [!IMPORTANT]
 > Every COM path added in v1.6 was executed against a **live AutoCAD 2026**, one smoke script per track (`scripts/smoke_*_com.py`), each run recorded in the changelog. Those runs found defects no headless test could. ActiveX refuses `entity.Layer` on a missing layer, where ezdxf quietly creates it, so `mech_part_draw` died after drawing every view. ActiveX calls a block reference `BLOCKREFERENCE`, not `INSERT`, so the parts list read nothing. And once pywin32's type-library cache existed, every listed entity arrived as a bare `IAcadEntity` with no line endpoints, so the room reader saw no walls and `arch_plan_from_spec` refused its first room label.
 
+## AutoCAD for Mac
+
+AutoCAD for Mac has no COM, no ActiveX and no AppleScript dictionary, so the `com` engine cannot drive it. The `mac` engine can: it keeps the ezdxf engine as the model — every tool works, with the results it has headlessly — and mirrors that model into the running AutoCAD, where you watch it being drawn. `AUTOCAD_MCP_BACKEND=auto` chooses it on macOS exactly when it would choose COM on Windows: when AutoCAD is open.
+
+```json
+{ "mcpServers": { "autocad": { "command": "autocad-mcp", "env": { "AUTOCAD_MCP_BACKEND": "mac" } } } }
+```
+
+**How it talks to AutoCAD.** The AutoLISP debug adapter that ships inside the app (`AutoLispDebugAdapter.app`, the one the VS Code AutoLISP extension uses) attaches to a *running* AutoCAD by process id and evaluates AutoLISP in it — in the background, with no keyboard input and no window focus. The helpers (live-document guard, push, pull) travel inside the evaluated expression: nothing is loaded from a file, nothing is written into AutoCAD's folders, and the "File Loading - Security Concern" dialog never appears (AutoCAD for Mac does not trust even its own Support folder for `load`).
+
+| You do | What happens in AutoCAD |
+|---|---|
+| Any drawing tool | The model is pushed about a second after the last edit: the live drawing is erased, purged and re-imported (`DXFIN`), then zoomed to extents |
+| `view_screenshot` | AutoCAD's own render of the live drawing (`PNGOUT`), not matplotlib's; `overlay_handles` still uses the headless renderer |
+| `drawing_export_dwg` / `drawing_save_as("x.dwg")` | A real DWG written by AutoCAD (`-WBLOCK *`), no ODA converter needed |
+| `system_run_lisp` / `system_run_command` | Run in AutoCAD, in the live drawing only. The model is not updated; `system_launch` pulls it back |
+| `system_launch` | Launches AutoCAD if needed and attaches. A live drawing that holds work is **pulled into the model** (your hand edits arrive); a new or empty one gets the model. The only call allowed to open a document, so the only one that brings AutoCAD to the foreground |
+
+**The live drawing.** It is AutoCAD's own empty, untitled drawing (claimed with an internal marker — `USERS1`) or an `mcp-live-*.dxf` that `system_launch` opened. Nothing else is ever erased: the guard runs inside AutoCAD before every `ERASE`. If the active drawing is someone else's work, the mirror does not open anything (opening a document needs the OS, and the OS raises AutoCAD); it waits, checking silently every 10 s, and `system_status().live.waiting_for_live_document` says so.
+
+**Edits by hand are not overwritten.** After each push the bridge fingerprints the live drawing (entity count, last handle, extents). If it differs before the next push, the push is refused (`live.conflict`) until `system_launch` pulls AutoCAD's version.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTOCAD_MCP_MAC_APP` | newest `AutoCAD <year>.app` | Which AutoCAD to drive (a path, or a name such as `AutoCAD 2027`) |
+| `AUTOCAD_MCP_MAC_DEBOUNCE` | `1` | Seconds without an edit before the model is pushed |
+| `AUTOCAD_MCP_MAC_AUTOZOOM` | `true` | Zoom to extents after each push |
+| `AUTOCAD_MCP_MAC_FORCE_PUSH` | `false` | Overwrite hand edits instead of refusing the push |
+| `AUTOCAD_MCP_MAC_TIMEOUT` | `45` | Seconds to wait for AutoCAD to answer one call |
+| `AUTOCAD_MCP_MAC_IDLE` | `4` | Seconds the debug session stays attached after the last call |
+| `AUTOCAD_MCP_MAC_BRIDGE_DIR` | `~/.autocad-mcp/bridge` | Private working folder (mode 0700) |
+
+> [!WARNING]
+> **One debug session at a time, and always disconnect it.** AutoCAD keeps a debug session that was not disconnected cleanly marked "being used to debug another file" until it is restarted. The server therefore attaches lazily, detaches a few seconds after the last call, keeps the adapter out of its own process tree, and detaches again from `atexit`, SIGTERM and SIGHUP and the shutdown hook. A `kill -9` of the server is the one thing it cannot survive: the next attach is refused with a message saying so, and quitting and reopening AutoCAD clears it. Two MCP servers cannot drive the same AutoCAD.
+
+Limits: the Mac must be unlocked (AutoCAD opens no windows on a locked session — the bridge says so instead of hanging); only the model space of the live drawing is mirrored; the live drawing's own styles win over a re-imported one with the same name after the purge, which only matters for styles still in use; non-ASCII text in `system_run_lisp` expressions is not guaranteed to survive (drawing content is, it travels as DXF).
+
 ## Evidence
 
 Everything below is produced by scripts in [`benchmarks/`](https://github.com/U-C4N/Autocad-MCP/blob/main/benchmarks/) and published as JSON under [`benchmarks/results/published/`](https://github.com/U-C4N/Autocad-MCP/tree/main/benchmarks/results/published).
@@ -368,7 +405,7 @@ Nothing loads a `.env` file — export these, or set them in your MCP client's `
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AUTOCAD_MCP_BACKEND` | `auto` | `auto`, `com`, or `ezdxf` |
+| `AUTOCAD_MCP_BACKEND` | `auto` | `auto`, `com`, `ezdxf`, or `mac` ([AutoCAD for Mac](#autocad-for-mac)) |
 | `CAD_PROGID` | `AutoCAD.Application` | COM ProgID the live backend attaches to |
 | `TOOL_PROFILE` | `full` | `lean` (65 curated tools, 55 with `TOOL_PACKS=core`) or `full` |
 | `TOOL_PACKS` | `all` | Vertical packs to advertise: `core,pid,settings,mech,arch,plant` (`core` always on) |

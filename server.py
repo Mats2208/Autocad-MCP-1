@@ -53,6 +53,7 @@ log = logging.getLogger("autocad_mcp")
 # ---------------------------------------------------------------------------
 
 _WIN32 = sys.platform == "win32"
+_DARWIN = sys.platform == "darwin"
 
 
 def _detect_autocad_running() -> bool:
@@ -76,6 +77,17 @@ def _detect_autocad_running() -> bool:
         return False
 
 
+def _autocad_for_mac_running() -> bool:
+    """True when an AutoCAD for Mac process is running (and the bridge can drive it)."""
+    try:
+        from backends.mac_bridge import MacBridge
+
+        return MacBridge().autocad_pid() is not None
+    except Exception as exc:
+        log.debug("AutoCAD for Mac detection failed: %s", exc)
+        return False
+
+
 async def _make_backend():
     """Create the best available backend."""
     # Through the setting, not straight off os.environ: reading the environment
@@ -92,6 +104,18 @@ async def _make_backend():
         await b.connect()
         return b
 
+    if backend_env == "mac" or (backend_env == "auto" and _DARWIN and _autocad_for_mac_running()):
+        # AutoCAD for Mac has no COM. This is the ezdxf engine mirrored into the
+        # running AutoCAD through its own AutoLISP debug adapter -- no keyboard,
+        # no window focus (see backends/mac_bridge.py). "auto" picks it exactly
+        # when it picks COM on Windows: when AutoCAD is open.
+        from backends.mac_live_backend import MacLiveBackend
+
+        b = MacLiveBackend()
+        await b.connect()
+        log.info("Using AutoCAD for Mac live backend (ezdxf model mirrored into AutoCAD)")
+        return b
+
     if backend_env in ("auto", "com"):
         if _WIN32:
             try:
@@ -105,8 +129,11 @@ async def _make_backend():
                 log.warning("COM backend init failed (%s)", exc)
                 if backend_env == "com":
                     raise RuntimeError(f"COM backend requested but failed: {exc}") from exc
-        else:
-            log.warning("COM backend requires Windows; falling back to ezdxf")
+        elif backend_env == "com":
+            log.warning(
+                "COM backend requires Windows; falling back to ezdxf "
+                "(on macOS use AUTOCAD_MCP_BACKEND=mac)"
+            )
 
     from backends.ezdxf_backend import EzdxfBackend
 
@@ -144,6 +171,13 @@ async def autocad_lifespan(server):
         yield {"backend": None, "init_error": str(exc)}
     finally:
         log.info("AutoCAD MCP Pro shutting down")
+        # Optional hook: the AutoCAD for Mac backend must detach its debug session.
+        closer = getattr(locals().get("backend", None), "aclose", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception as exc:  # shutdown must not raise
+                log.warning("backend shutdown hook failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -10768,7 +10802,7 @@ async def _diff_revision(backend, path: str | None, *, tol: float, role: str):
         snap = await take_snapshot(backend, None)
         blocks = None
         run = getattr(backend, "_async", None)
-        if backend.name == "ezdxf" and run is not None:
+        if backend.name in ("ezdxf", "autocad-mac") and run is not None:
             blocks = await run(lambda: block_signatures(backend._doc, tol=tol))
         return snap, blocks
     validated = validate_path(path)
