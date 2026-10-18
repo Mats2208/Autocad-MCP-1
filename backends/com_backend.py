@@ -24,7 +24,7 @@ import config
 from engineering.measure import is_self_intersecting, polygon_area_perimeter
 from security import sanitize_macro_argument, sanitize_symbol_name, validate_path
 
-from . import ocs
+from . import com_filter, ocs
 from .base import (
     AutoCADBackend,
     BlockInfo,
@@ -83,8 +83,9 @@ _COM_ERROR: tuple[type[BaseException], ...] = (pywintypes.com_error,) if _COM_IM
 #: ``scripts/smoke_settings_com.py --build-dwt``: ``Documents.Count`` right
 #: after ``Documents.Open`` and right after ``Close(False)``) — and for as long
 #: as an operator or another client leaves a command prompt open. pywin32 has
-#: no ``CoRegisterMessageFilter``, the client-side hook that would retry this
-#: per call, so the read-only reads that follow a switch wait it out themselves.
+#: no ``CoRegisterMessageFilter``, so backends/com_filter.py registers one with
+#: ctypes on the COM thread (_com_init) and COM retries every refused call, writes
+#: included; the explicit wait below stays for a thread running without it.
 _RPC_E_CALL_REJECTED = -2147418111
 
 
@@ -125,9 +126,16 @@ _COM_STATE: dict[str, Any] = {}  # keys: "app"
 
 
 def _com_init():
-    """COM thread initializer – called once by the ThreadPoolExecutor."""
+    """COM thread initializer – called once by the ThreadPoolExecutor.
+
+    Registers the apartment's message filter (backends/com_filter.py) right after CoInitialize: AutoCAD answers
+    RPC_E_CALL_REJECTED while it switches documents (longer when it is not the foreground app), and without a
+    client filter COM fails the call at once, so a drawing_new followed by arch_wall died on AddHatch.ObjectName.
+    With it COM waits and retries the call, for a little less than the per-call deadline.
+    """
     if _COM_IMPORTS_OK:
         pythoncom.CoInitialize()
+        com_filter.register(budget_s=max(5.0, config.settings.com_call_timeout - 5.0))
 
 
 def _com_teardown():
@@ -139,6 +147,7 @@ def _com_teardown():
     """
     _COM_STATE.pop("app", None)
     if _COM_IMPORTS_OK:
+        com_filter.unregister()
         try:
             pythoncom.CoUninitialize()
         except Exception:

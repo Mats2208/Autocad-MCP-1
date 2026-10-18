@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Live AutoCAD no longer needs to be the window in front.** The COM thread registers a message filter
+  (`backends/com_filter.py`, ctypes: pywin32 does not wrap `CoRegisterMessageFilter`), so COM retries a call
+  that AutoCAD refuses with `RPC_E_CALL_REJECTED`. AutoCAD refuses calls while it switches documents, and longer
+  when it is in the background.
+  - Before, the refusal failed the call at once. pywin32's late binding then reported it as a bare
+    `AttributeError: AddHatch.ObjectName` or `<unknown>.Count`, so a `drawing_new` followed by `arch_wall`, or a
+    `drawing_save_as`, failed half-way unless someone clicked AutoCAD.
+  - Measured on AutoCAD 2027 with `scripts/stress_switch.py` (Documents.Add + AddLine + AddHatch + SaveAs + Close,
+    AutoCAD in the background): 3 of 15 rounds passed before, 15 of 15 after (7 retries).
+  - Retries stop five seconds short of `COM_CALL_TIMEOUT`. A call AutoCAD rejects outright is never retried.
+- **Nothing reaches another application.** `tests/test_com_filter.py` fails if any module simulates keys or mouse
+  events or moves the window focus (SendKeys, SendInput, keybd_event, SetForegroundWindow, pyautogui, ...).
+  Commands go through AutoCAD's COM API only; `SendCommand` is AutoCAD's own command queue, not the keyboard.
+
 ## [1.6.0] — 2026-09-25
 
 The v1.6 roadmap, shipped as five tracks: 154 → 247 registered tools in 28
