@@ -146,6 +146,7 @@ def _com_teardown():
     SendCommand eventually unblocks, instead of leaking the apartment forever.
     """
     _COM_STATE.pop("app", None)
+    _COM_STATE.pop("doc", None)
     if _COM_IMPORTS_OK:
         com_filter.unregister()
         try:
@@ -314,12 +315,65 @@ def _template_as_dwt(app, source: Path) -> tuple[Path, bool]:
     return dwt, False
 
 
+def _pin_document(doc) -> None:
+    """Make ``doc`` the server's working drawing (drawing_new / drawing_open / document_activate).
+
+    The pin belongs to the application object it was made on: a reconnect (a new ``app``) drops it.
+    """
+    _COM_STATE["doc"] = (_COM_STATE.get("app"), doc)
+
+
+def _working_document(app):
+    """The pinned working drawing while it is still open in AutoCAD, else None (and the pin is dropped)."""
+    pinned = _COM_STATE.get("doc")
+    if pinned is None:
+        return None
+    pinned_app, doc = pinned
+    if pinned_app is not app:
+        _COM_STATE.pop("doc", None)
+        return None
+    try:
+        key = (str(doc.Name), str(doc.FullName))
+        for d in app.Documents:
+            if (str(d.Name), str(d.FullName)) == key:
+                return d
+    except _COM_ERROR:
+        pass
+    _COM_STATE.pop("doc", None)
+    return None
+
+
 def _acad_doc():
-    """Return active AutoCAD document."""
+    """The drawing the server works on.
+
+    That is the drawing it last created, opened or activated, while it stays open, else AutoCAD's active
+    document. Following ``ActiveDocument`` on every call meant one click on another drawing tab, in the middle of
+    a tool, redirected the tool's writes and its ``drawing_save_as`` to that drawing: a gatehouse was saved over
+    by a club house that way. Writing to a drawing that is not the active one works through COM.
+    """
     app = _acad_app()
     if app.Documents.Count == 0:
         raise RuntimeError("No drawing is open in AutoCAD. Open or create a .dwg file first.")
-    return app.ActiveDocument
+    doc = _working_document(app)
+    return app.ActiveDocument if doc is None else doc
+
+
+def _acad_doc_active():
+    """``_acad_doc()``, made AutoCAD's active drawing first.
+
+    This is for what only acts on the active drawing: the view (zoom, screenshot) and ``SendCommand``.
+    ``Document.Activate`` switches AutoCAD's own tab and leaves the OS foreground window alone (measured with
+    Notepad in front: no focus change). It is best effort: a drawing that cannot be activated is still
+    returned, and the tool runs as it did before.
+    """
+    doc = _acad_doc()
+    try:
+        active = doc.Application.ActiveDocument
+        if (str(active.Name), str(active.FullName)) != (str(doc.Name), str(doc.FullName)):
+            doc.Activate()
+    except (AttributeError, *_COM_ERROR) as exc:
+        log.debug("could not activate the working drawing: %s", exc)
+    return doc
 
 
 def _msp():
@@ -330,13 +384,33 @@ def _msp():
     space. ``ActiveLayout.Block`` is the same object as ``ModelSpace`` while the
     Model tab is active, so the model-space path is unchanged; on a paper layout
     it is the sheet, which is where a title block belongs.
+
+    AutoCAD answers ``ActiveLayout`` of a drawing that is not the active one with the *active* drawing's layout
+    (measured on AutoCAD 2027: ``a.ActiveLayout.Block.AddLine`` landed in the drawing in front). So the block's
+    owner is checked. When it is not the working drawing, that drawing is activated, which switches AutoCAD's tab
+    without touching the OS focus, and asked again. If it still does not match, its ``ModelSpace`` is used, which
+    is always its own.
     """
     doc = _acad_doc()
+
+    def _own_block():
+        block = doc.ActiveLayout.Block
+        owner = block.Document
+        if (str(owner.Name), str(owner.FullName)) == (str(doc.Name), str(doc.FullName)):
+            return block
+        return None
+
     try:
-        return doc.ActiveLayout.Block
+        block = _own_block()
+        if block is None:
+            doc.Activate()
+            block = _own_block()
+        if block is not None:
+            return block
+        log.debug("ActiveLayout.Block belongs to another drawing; using %s's ModelSpace", doc.Name)
     except Exception as exc:  # never strand a write over a layout probe
         log.debug("ActiveLayout.Block unavailable (%s); using ModelSpace", exc)
-        return doc.ModelSpace
+    return doc.ModelSpace
 
 
 def _int_member(obj, name: str) -> int | None:
@@ -1804,7 +1878,7 @@ class ComBackend(AutoCADBackend):
             app = _acad_app()
             if app.Documents.Count == 0:
                 return None
-            doc = app.ActiveDocument
+            doc = _acad_doc()
             return (str(doc.Name), str(doc.FullName))
 
         def _sync():
@@ -1959,6 +2033,7 @@ class ComBackend(AutoCADBackend):
             app = _acad_app()
             if not template:
                 doc = app.Documents.Add()
+                _pin_document(doc)
                 return {"ok": True, "name": self._wait_out_rejected_call(lambda: doc.Name)}
             source = Path(template)
             if not source.is_file():
@@ -1973,6 +2048,7 @@ class ComBackend(AutoCADBackend):
                 dwt, cached = _template_as_dwt(app, source)
                 result["template_dwt"] = {"path": str(dwt), "cached": cached}
             doc = app.Documents.Add(str(dwt))
+            _pin_document(doc)
             result["name"] = self._wait_out_rejected_call(lambda: doc.Name)
             return result
 
@@ -1984,6 +2060,7 @@ class ComBackend(AutoCADBackend):
         def _sync():
             app = _acad_app()
             doc = app.Documents.Open(path)
+            _pin_document(doc)
             name, full_name = self._wait_out_rejected_call(lambda: (doc.Name, doc.FullName))
             return {"ok": True, "name": name, "path": full_name}
 
@@ -2556,6 +2633,7 @@ class ComBackend(AutoCADBackend):
             previous = str(app.ActiveDocument.Name) if int(app.Documents.Count) else None
             doc = self._com_find_document(app, name_or_path)
             doc.Activate()
+            _pin_document(doc)
             return {
                 "ok": True,
                 "active": str(doc.Name),
@@ -3079,7 +3157,7 @@ class ComBackend(AutoCADBackend):
         clean = validate_name(name, what="UCS name")
 
         def _sync():
-            doc = _acad_doc()
+            doc = _acad_doc_active()
             if clean.lower() == WORLD:
                 # No ActiveX member selects WCS; the command does. Same guard as
                 # system_run_command: never send into an active prompt. The
@@ -4591,7 +4669,7 @@ class ComBackend(AutoCADBackend):
         """
 
         def _sync():
-            doc = _acad_doc()
+            doc = _acad_doc_active()
             # AUDITCTL is a document sysvar (the Application has no
             # GetVariable / SetVariable). The read is optional only for a host
             # that does not expose the variable at all; then nothing is set
@@ -4659,7 +4737,7 @@ class ComBackend(AutoCADBackend):
 
     async def drawing_undo(self) -> dict:
         def _sync():
-            doc = _acad_doc()
+            doc = _acad_doc_active()
             doc.SendCommand("_UNDO 1\n")
             return {"ok": True, "message": "Undo applied"}
 
@@ -4667,7 +4745,7 @@ class ComBackend(AutoCADBackend):
 
     async def drawing_redo(self) -> dict:
         def _sync():
-            doc = _acad_doc()
+            doc = _acad_doc_active()
             doc.SendCommand("_REDO\n")
             return {"ok": True, "message": "Redo applied"}
 
@@ -6755,8 +6833,9 @@ class ComBackend(AutoCADBackend):
     async def view_zoom_extents(self) -> dict:
         def _sync():
             app = _acad_app()
+            doc = _acad_doc_active()
             app.ZoomExtents()
-            _acad_doc().Regen(0)
+            doc.Regen(0)
             return {"ok": True}
 
         return await self._run(_sync)
@@ -6764,6 +6843,7 @@ class ComBackend(AutoCADBackend):
     async def view_zoom_window(self, x1, y1, x2, y2) -> dict:
         def _sync():
             app = _acad_app()
+            _acad_doc_active()
             app.ZoomWindow(_apoint(x1, y1), _apoint(x2, y2))
             return {"ok": True}
 
@@ -6797,6 +6877,8 @@ class ComBackend(AutoCADBackend):
             hwnd = _find_autocad_hwnd()
             if hwnd is None:
                 return None
+            if _acad_app().Documents.Count:
+                _acad_doc_active()  # the capture shows the working drawing, not whatever tab is in front
             return _capture_window(hwnd)
 
         return await self._run(_sync)
@@ -6808,7 +6890,7 @@ class ComBackend(AutoCADBackend):
             return {"ok": False, "error": "A transaction is already active"}
 
         def _sync():
-            doc = _acad_doc()
+            doc = _acad_doc_active()
             # `_UNDO _M` below is typed at the command line; with a command or
             # prompt already active it would be swallowed as that command's
             # input and no mark would exist for the rollback to go back to.
@@ -6901,6 +6983,7 @@ class ComBackend(AutoCADBackend):
                 version = app.Version
                 doc_count = app.Documents.Count
                 active_doc = app.ActiveDocument.Name if doc_count > 0 else None
+                working = _working_document(app) if doc_count > 0 else None
                 return {
                     "backend": "com",
                     "connected": True,
@@ -6911,6 +6994,9 @@ class ComBackend(AutoCADBackend):
                     "autocad_version": version,
                     "open_documents": doc_count,
                     "active_document": active_doc,
+                    # The drawing the tools act on (the last one created, opened or activated through
+                    # the server); None when it follows AutoCAD's active document.
+                    "working_document": str(working.Name) if working is not None else None,
                     "transaction_active": tx_active,
                     # Accurate capability list: the backend authors 2D entities
                     # (lines/arcs/circles/polylines/text/hatch/dims/blocks). It
@@ -6988,7 +7074,7 @@ class ComBackend(AutoCADBackend):
         # otherwise SendCommand returns but AutoCAD stays at a prompt and the
         # next COM call deadlocks. Example: "_-LINETYPE _LOAD CENTER acad.lin\n\n"
         def _sync():
-            doc = _acad_doc()
+            doc = _acad_doc_active()
             # CMDACTIVE is read on the document (the Application has no
             # GetVariable); through the Application this guard never fired.
             cmd_active = int(doc.GetVariable("CMDACTIVE"))
@@ -7326,7 +7412,7 @@ class ComBackend(AutoCADBackend):
         typed = validate_mleaderstyle(values)
 
         def _sync():
-            doc = _acad_doc()
+            doc = _acad_doc_active()
             dictionary = _com_mleaderstyle_dictionary(doc, create=True)
             wanted = clean.lower()
             if any(

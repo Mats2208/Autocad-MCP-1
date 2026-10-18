@@ -19,6 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Measured on AutoCAD 2027 with `scripts/stress_switch.py` (Documents.Add + AddLine + AddHatch + SaveAs + Close,
     AutoCAD in the background): 3 of 15 rounds passed before, 15 of 15 after (7 retries).
   - Retries stop five seconds short of `COM_CALL_TIMEOUT`. A call AutoCAD rejects outright is never retried.
+- **The server works on its own drawing, not on the tab in front.**
+  - **The bug.** Every call resolved the drawing through `ActiveDocument`. When the operator brought another
+    drawing to the front in the middle of a sequence, the rest of the tool calls went there.
+    `drawing_save_as` then saved the operator's drawing under the server's file name; on AutoCAD 2027 a club
+    house was written over a gatehouse that way. `scripts/tab_switch_live.py` reproduces it: on `main` the line
+    lands in the operator's drawing and that drawing is saved; with the fix the line and the file are the
+    server's.
+  - **The fix.** `drawing_new`, `drawing_open` and `document_activate` pin the working drawing. `_acad_doc()`
+    returns it while it stays open, and otherwise follows `ActiveDocument` as before. The pin is tied to the
+    application object, so a reconnect drops it. `system_status` reports `working_document`.
+  - **AutoCAD quirk.** AutoCAD answers `ActiveLayout` of a drawing that is not the active one with the active
+    drawing's layout. `_msp()` therefore checks the block's owner, activates the working drawing (a tab switch
+    inside AutoCAD, with no OS focus change) and falls back to its `ModelSpace`.
+  - **What is activated first.** The view tools (zoom, screenshot) and every `SendCommand` path activate the
+    working drawing first, through `_acad_doc_active()`.
+  - **Measured.** `scripts/who_steals_focus.py` and `who_steals_focus_tools.py` put Notepad in front before each
+    COM call and each tool (`drawing_new`, `arch_wall`, `drawing_save_as`, `drawing_close` ...). None brought
+    AutoCAD to the front.
 - **Nothing reaches another application.** `tests/test_com_filter.py` fails if any module simulates keys or mouse
   events or moves the window focus (SendKeys, SendInput, keybd_event, SetForegroundWindow, pyautogui, ...).
   Commands go through AutoCAD's COM API only; `SendCommand` is AutoCAD's own command queue, not the keyboard.
