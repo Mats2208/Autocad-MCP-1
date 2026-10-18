@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Measured.** `scripts/who_steals_focus.py` and `who_steals_focus_tools.py` put Notepad in front before each
     COM call and each tool (`drawing_new`, `arch_wall`, `drawing_save_as`, `drawing_close` ...). None brought
     AutoCAD to the front.
+- **A layer missing from the drawing is created, and AutoCAD's own words reach the error.** A title block on a
+  drawing opened with `drawing_open` (no bootstrap layers) failed with a bare `Exception occurred.`; AutoCAD's
+  EXCEPINFO said `Key not found` (layer `TITLEBLOCK`). `_apply_entity_attrs` now adds the missing layer to the
+  entity's own drawing, and `_run` appends AutoCAD's description to every COM error (`AutoCAD says: ...`).
 - **Nothing reaches another application.** `tests/test_com_filter.py` fails if any module simulates keys or mouse
   events or moves the window focus (SendKeys, SendInput, keybd_event, SetForegroundWindow, pyautogui, ...).
   Commands go through AutoCAD's COM API only; `SendCommand` is AutoCAD's own command queue, not the keyboard.

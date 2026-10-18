@@ -592,10 +592,31 @@ def _ensure_linetype_loaded(name: str) -> None:
     _load_linetype(doc, name, _default_lin_file(doc))
 
 
+#: AutoCAD's description when a name (a layer, a style, a block) is not in the drawing's table.
+_KEY_NOT_FOUND = "Key not found"
+
+
+def _com_description(exc) -> str:
+    """AutoCAD's own words for a COM failure (the EXCEPINFO description), or ''."""
+    info = exc.args[2] if len(getattr(exc, "args", ())) > 2 else None
+    return str(info[2]) if info and len(info) > 2 and info[2] else ""
+
+
 def _apply_entity_attrs(entity, layer: str | None, color: int | None, linetype: str | None):
-    """Apply common entity attributes after creation."""
+    """Apply common entity attributes after creation.
+
+    A layer missing from the entity's own drawing is created first. Before, the entity was left on layer 0 and the
+    tool failed with a bare "Exception occurred." (AutoCAD: "Key not found"). That happened with a title block on a
+    drawing opened with drawing_open, which never got the bootstrap layers.
+    """
     if layer is not None:
-        entity.Layer = layer
+        try:
+            entity.Layer = layer
+        except _COM_ERROR as exc:
+            if _com_description(exc) != _KEY_NOT_FOUND:
+                raise
+            entity.Document.Layers.Add(layer)
+            entity.Layer = layer
     if color is not None:
         entity.color = int(color)
     if linetype is not None:
@@ -1966,8 +1987,10 @@ class ComBackend(AutoCADBackend):
             if hr in (-2147221246, -2147221005, -2147417842):
                 _COM_STATE.pop("app", None)
                 self._connected = False
+            said = _com_description(e)
             raise RuntimeError(
                 f"AutoCAD COM error ({hr:#010x}): {e.args[1] if len(e.args) > 1 else e}"
+                + (f" AutoCAD says: {said}" if said else "")
             ) from e
 
     # ── drawing management ────────────────────────────────────────────────────

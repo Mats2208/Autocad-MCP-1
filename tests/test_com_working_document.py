@@ -91,3 +91,45 @@ def test_a_pin_from_another_application_object_is_dropped(app, monkeypatch):
     monkeypatch.setattr(cb, "_acad_app", lambda: other)
     assert cb._acad_doc() is fresh  # a reconnect does not resurrect the old object
     assert "doc" not in cb._COM_STATE
+
+
+# --- a missing layer is created; AutoCAD's own words reach the error -------------------------------------------
+
+pywintypes = pytest.importorskip("pywintypes")
+
+
+def _key_not_found():
+    return pywintypes.com_error(
+        -2147352567,
+        "Exception occurred.",
+        (0, "AutoCAD.Application", "Key not found", None, -2145386476, -2145386476),
+        None,
+    )
+
+
+class FakeEntity:
+    def __init__(self, layers):
+        self._layers = layers
+        self.Document = SimpleNamespace(Layers=SimpleNamespace(Add=lambda name: layers.add(name)))
+        self._layer = "0"
+
+    @property
+    def Layer(self):  # noqa: N802 - COM name
+        return self._layer
+
+    @Layer.setter
+    def Layer(self, name):  # noqa: N802 - COM name
+        if name not in self._layers:
+            raise _key_not_found()
+        self._layer = name
+
+
+def test_a_layer_missing_from_the_drawing_is_created_on_the_entitys_document():
+    layers = {"0"}
+    e = FakeEntity(layers)
+    cb._apply_entity_attrs(e, "TITLEBLOCK", None, None)
+    assert e.Layer == "TITLEBLOCK" and "TITLEBLOCK" in layers
+
+
+def test_the_error_carries_autocads_description():
+    assert cb._com_description(_key_not_found()) == "Key not found"
